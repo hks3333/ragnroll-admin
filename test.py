@@ -1,6 +1,8 @@
 import os
+import csv
 import streamlit as st
 import boto3
+from io import StringIO
 
 # Initialize S3 client
 s3 = boto3.client(
@@ -36,7 +38,6 @@ if "page" not in st.session_state:
     st.session_state.page = "Home"
 
 # Sidebar for navigation
-
 st.sidebar.title("Admin")
 if st.sidebar.button("Home"):
     st.session_state.page = "Home"
@@ -44,7 +45,6 @@ if st.sidebar.button("Upload Files"):
     st.session_state.page = "Upload Files"
 if st.sidebar.button("Edit Existing Files"):
     st.session_state.page = "Edit Existing Files"
-
 
 # Function to upload file to S3
 def upload_to_s3(file, bucket_name, object_name):
@@ -54,6 +54,31 @@ def upload_to_s3(file, bucket_name, object_name):
     except Exception as e:
         st.error(f"Error uploading file to S3: {e}")
         return False
+
+def generate_metadata_csv(file_name, departments, semesters, tags):
+    # Replace "All" with the full list of values
+    if "All" in departments:
+        departments = DEPARTMENTS
+    if "All" in semesters:
+        semesters = SEMESTERS
+    
+    # Create a CSV string with headers and data
+    csv_output = StringIO()
+    writer = csv.writer(csv_output)
+    
+    # Write headers
+    writer.writerow(["file_name", "departments", "semesters", "tags"])
+    
+    # Write data
+    writer.writerow([
+        file_name,                     # file_name
+        ",".join(departments),         # departments
+        ",".join(semesters),           # semesters
+        ",".join(tags)                 # tags
+    ])
+    
+    # Return the CSV string
+    return csv_output.getvalue()
 
 # Homepage
 def homepage():
@@ -115,34 +140,48 @@ def upload_page():
     if st.button("Upload All Files"):
         if uploaded_files:
             for i, uploaded_file in enumerate(uploaded_files):
-                # Generate S3 object name
-                object_name = f"documents/{uploaded_file.name}"
+                # Rename the file
+                new_name = st.session_state[f"name_{i}"]
+                new_file_name = f"{new_name}.pdf"
                 
-                # Prepare metadata
-                metadata = {
-                    "file_name": st.session_state[f"name_{i}"],
-                    "departments": ",".join(st.session_state[f"dept_{i}"]),
-                    "semesters": ",".join(st.session_state[f"sem_{i}"]),
-                    "tags": ",".join(st.session_state[f"tags_{i}"])
-                }
+                # Generate metadata CSV
+                metadata = generate_metadata_csv(
+                    new_name,  # File name without extension
+                    st.session_state[f"dept_{i}"],
+                    st.session_state[f"sem_{i}"],
+                    st.session_state[f"tags_{i}"]
+                )
                 
-                # Upload file to S3 with metadata
-                try:
-                    s3.upload_fileobj(
-                        uploaded_file,
-                        "ragnroll",
-                        object_name,
-                        ExtraArgs={"Metadata": metadata}
-                    )
-                    st.success(f"File {uploaded_file.name} uploaded to S3 with metadata.")
-                except Exception as e:
-                    st.error(f"Error uploading {uploaded_file.name}: {e}")
+                # Upload the renamed PDF file to S3
+                pdf_object_name = f"documents/{new_file_name}"
+                if upload_to_s3(uploaded_file, "ragnroll", pdf_object_name):
+                    st.success(f"File {new_file_name} uploaded to S3.")
+                    
+                    # Upload the metadata CSV file to S3
+                    # Upload the metadata CSV file to S3
+                    metadata_object_name = f"documents/{new_name}.csv"
+                    try:
+                        # Generate the CSV metadata
+                        csv_metadata = generate_metadata_csv(
+                            new_name,  # File name without extension
+                            st.session_state[f"dept_{i}"],
+                            st.session_state[f"sem_{i}"],
+                            st.session_state[f"tags_{i}"]
+                        )
+                        
+                        # Upload the CSV file to S3
+                        s3.put_object(
+                            Bucket="ragnroll",
+                            Key=metadata_object_name,
+                            Body=csv_metadata
+                        )
+                        st.success(f"Metadata for {new_file_name} uploaded to S3.")
+                    except Exception as e:
+                        st.error(f"Error uploading metadata for {new_file_name}: {e}")
         else:
             st.warning("No files uploaded.")
 
-
-
-
+# Edit page
 def edit_page():
     st.write("### Edit Existing Files")
 
@@ -150,7 +189,7 @@ def edit_page():
     try:
         response = s3.list_objects_v2(Bucket="ragnroll", Prefix="documents/")
         if "Contents" in response:
-            files = [obj["Key"] for obj in response["Contents"]]
+            files = [obj["Key"] for obj in response["Contents"] if obj["Key"].endswith(".pdf")]
         else:
             st.warning("No files found in the S3 bucket.")
             return
@@ -162,22 +201,34 @@ def edit_page():
     selected_file = st.selectbox("Select a file to edit", files, index=None)
 
     if selected_file:
-        # Fetch metadata for the selected file
+        # Fetch metadata CSV file
+        metadata_file = selected_file.replace(".pdf", ".csv")
         try:
-            metadata = s3.head_object(Bucket="ragnroll", Key=selected_file)["Metadata"]
+            metadata_response = s3.get_object(Bucket="ragnroll", Key=metadata_file)
+            metadata_content = metadata_response["Body"].read().decode("utf-8")
+            
+            # Parse the CSV content
+            reader = csv.reader(StringIO(metadata_content))
+            headers = next(reader)  # Skip headers
+            file_name, departments, semesters, tags = next(reader)
+            
+            # Split comma-separated values into lists
+            departments = departments.split(",")
+            semesters = semesters.split(",")
+            tags = tags.split(",")
         except Exception as e:
             st.error(f"Error fetching metadata for {selected_file}: {e}")
             metadata = {}
 
-        # Display file name from metadata (not the original PDF name)
-        file_name = metadata.get("file_name", selected_file.split("/")[-1].replace(".pdf", ""))
+        # Display file name (editable)
+        file_name = file_name or selected_file.split("/")[-1].replace(".pdf", "")
         new_name = st.text_input("File Name", value=file_name, key="edit_name")
 
         # Department selection (multi-select dropdown with "All" option)
         departments = st.multiselect(
             "Department(s)",
             options=["All"] + DEPARTMENTS,
-            default=metadata.get("departments", "").split(",") if metadata.get("departments") else [],
+            default=departments,
             key="edit_dept"
         )
         if "All" in departments:
@@ -187,7 +238,7 @@ def edit_page():
         semesters = st.multiselect(
             "Semester(s)",
             options=["All"] + SEMESTERS,
-            default=metadata.get("semesters", "").split(",") if metadata.get("semesters") else [],
+            default=semesters,
             key="edit_sem"
         )
         if "All" in semesters:
@@ -197,25 +248,26 @@ def edit_page():
         tags = st.multiselect(
             "Tags",
             options=PREDEFINED_TAGS,
-            default=metadata.get("tags", "").split(",") if metadata.get("tags") else [],
+            default=tags,
             key="edit_tags"
         )
 
         # Save changes button
         if st.button("Save Changes"):
             try:
-                # Update metadata in S3
-                s3.copy_object(
+                # Generate updated metadata CSV
+                updated_metadata_csv = generate_metadata_csv(
+                    new_name,
+                    departments,
+                    semesters,
+                    tags
+                )
+
+                # Upload updated metadata CSV file to S3
+                s3.put_object(
                     Bucket="ragnroll",
-                    Key=selected_file,
-                    CopySource={"Bucket": "ragnroll", "Key": selected_file},
-                    Metadata={
-                        "file_name": new_name,
-                        "departments": ",".join(departments),
-                        "semesters": ",".join(semesters),
-                        "tags": ",".join(tags)
-                    },
-                    MetadataDirective="REPLACE"
+                    Key=metadata_file,
+                    Body=updated_metadata_csv
                 )
                 st.success("Metadata updated successfully!")
             except Exception as e:
@@ -224,16 +276,19 @@ def edit_page():
         # Delete file button
         if st.button("Delete File"):
             try:
+                # Delete PDF file from S3
                 s3.delete_object(Bucket="ragnroll", Key=selected_file)
-                st.success(f"File {selected_file} deleted successfully!")
+                
+                # Delete metadata CSV file from S3
+                s3.delete_object(Bucket="ragnroll", Key=metadata_file)
+                
+                st.success(f"File {selected_file} and its metadata deleted successfully!")
                 # Rerun the script to refresh the file list
                 st.rerun()
             except Exception as e:
                 st.error(f"Error deleting file: {e}")
     else:
         st.warning("No file selected.")
-
-
 
 # Page routing
 if st.session_state.page == "Home":
